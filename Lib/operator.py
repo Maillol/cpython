@@ -267,20 +267,46 @@ class itemgetter:
     Return a callable object that fetches the given item(s) from its operand.
     After f = itemgetter(2), the call f(r) returns r[2].
     After g = itemgetter(2, 5, 3), the call g(r) returns (r[2], r[5], r[3])
-    """
-    __slots__ = ('_items', '_call')
 
-    def __init__(self, item, *items):
-        if not items:
-            self._items = (item,)
-            def func(obj):
-                return obj[item]
-            self._call = func
+    You can create a callable object that returns a default value if it cannot 
+    get the item(s).
+
+    After f = itemgetter(2, default=3), the call f(r) returns 
+      r[2] if 2 in r, else 3.
+    """
+    __slots__ = ('_items', '_call', '_default')
+
+    _no_default = object()
+
+    def _callable(self, default):
+        if default is self._no_default:
+            def func(obj, key):
+                return obj[key]
+
         else:
-            self._items = items = (item,) + items
-            def func(obj):
-                return tuple(obj[i] for i in items)
-            self._call = func
+            def func(obj, key):
+                try:
+                    return obj[key]
+                except LookupError:
+                    return default
+
+        if len(self._items) == 1:
+            item = self._items[0]
+            return lambda obj: func(obj, item)
+        else:
+            items = self._items
+            return lambda obj: tuple(func(obj, i) for i in items)
+
+    def __init__(self, item, *items, **kwargs):
+        unexpected_kwarg = next(
+            (arg for arg in kwargs if arg != 'default'), None)
+        if unexpected_kwarg is not None:
+            raise TypeError(f"itemgetter() got an unexpected"
+                            " keyword argument '{unexpected_kwarg}'")
+
+        self._default = kwargs.pop('default', self._no_default)
+        self._items = (item,) + items
+        self._call = self._callable(self._default)
 
     def __call__(self, obj):
         return self._call(obj)
@@ -291,7 +317,17 @@ class itemgetter:
                               ', '.join(map(repr, self._items)))
 
     def __reduce__(self):
-        return self.__class__, self._items
+        if self._default == self._no_default:
+            return type(self), (self._items,), (self._items,)
+        return type(self), (self._items,), (self._items, self._default)
+
+    def __setstate__(self, state):
+        if len(state) == 1:
+             state += (self._no_default,)
+
+        self._items, self._default = state
+        self._call = self._callable(self._default)
+
 
 class methodcaller:
     """

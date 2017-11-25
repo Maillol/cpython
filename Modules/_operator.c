@@ -937,6 +937,7 @@ typedef struct {
     PyObject_HEAD
     Py_ssize_t nitems;
     PyObject *item;
+    PyObject *defaultvalue;
 } itemgetterobject;
 
 static PyTypeObject itemgetter_type;
@@ -946,11 +947,20 @@ static PyObject *
 itemgetter_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
 {
     itemgetterobject *ig;
-    PyObject *item;
+    PyObject *item, *emptytuple, *defaultvalue = NULL;
     Py_ssize_t nitems;
+    static char *kwlist[] = {"default", NULL};
 
-    if (!_PyArg_NoKeywords("itemgetter", kwds))
+    emptytuple = PyTuple_New(0);
+    if (emptytuple == NULL)
         return NULL;
+
+    if (!PyArg_ParseTupleAndKeywords(emptytuple, kwds, "|$O:itemgetter",
+                                     kwlist, &defaultvalue)) {
+        Py_DECREF(emptytuple);
+        return NULL;
+    }
+    Py_DECREF(emptytuple);
 
     nitems = PyTuple_GET_SIZE(args);
     if (nitems <= 1) {
@@ -965,8 +975,10 @@ itemgetter_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
         return NULL;
 
     Py_INCREF(item);
+    Py_XINCREF(defaultvalue);
     ig->item = item;
     ig->nitems = nitems;
+    ig->defaultvalue = defaultvalue;
 
     PyObject_GC_Track(ig);
     return (PyObject *)ig;
@@ -977,6 +989,7 @@ itemgetter_dealloc(itemgetterobject *ig)
 {
     PyObject_GC_UnTrack(ig);
     Py_XDECREF(ig->item);
+    Py_XDECREF(ig->defaultvalue);
     PyObject_GC_Del(ig);
 }
 
@@ -993,12 +1006,20 @@ itemgetter_call(itemgetterobject *ig, PyObject *args, PyObject *kw)
     PyObject *obj, *result;
     Py_ssize_t i, nitems=ig->nitems;
 
-    if (!_PyArg_NoKeywords("itemgetter", kw))
+    if (kw != NULL && !_PyArg_NoKeywords("itemgetter", kw))
         return NULL;
     if (!PyArg_UnpackTuple(args, "itemgetter", 1, 1, &obj))
         return NULL;
-    if (nitems == 1)
-        return PyObject_GetItem(obj, ig->item);
+    if (nitems == 1) {
+        result = PyObject_GetItem(obj, ig->item);
+        if (result == NULL && PyErr_ExceptionMatches(PyExc_LookupError)) {
+            result = ig->defaultvalue;
+            if (result != NULL)
+                PyErr_Clear();
+        }
+
+        return result;
+    }
 
     assert(PyTuple_Check(ig->item));
     assert(PyTuple_GET_SIZE(ig->item) == nitems);
@@ -1012,11 +1033,16 @@ itemgetter_call(itemgetterobject *ig, PyObject *args, PyObject *kw)
         item = PyTuple_GET_ITEM(ig->item, i);
         val = PyObject_GetItem(obj, item);
         if (val == NULL) {
-            Py_DECREF(result);
-            return NULL;
+            val = ig->defaultvalue;
+            if (val == NULL || !PyErr_ExceptionMatches(PyExc_LookupError)) {
+                Py_DECREF(result);
+                return NULL;
+            }
+            PyErr_Clear();
         }
         PyTuple_SET_ITEM(result, i, val);
     }
+
     return result;
 }
 
@@ -1039,12 +1065,63 @@ itemgetter_repr(itemgetterobject *ig)
     return repr;
 }
 
+/* Pickle strategy:
+   __reduce__ by itself doesn't support getting kwargs in the unpickle
+   operation so we define a __setstate__ that replaces all the information
+   about the itemgetter.  If we only replaced part of it someone would use
+   it as a hook to do strange things.
+ */
+
 static PyObject *
 itemgetter_reduce(itemgetterobject *ig)
 {
-    if (ig->nitems == 1)
-        return Py_BuildValue("O(O)", Py_TYPE(ig), ig->item);
-    return PyTuple_Pack(2, Py_TYPE(ig), ig->item);
+    if (ig->defaultvalue == NULL) {
+        if (ig->nitems == 1)
+            return Py_BuildValue("O(O)((O))", Py_TYPE(ig), ig->item, ig->item);
+        return Py_BuildValue("OO(O)", Py_TYPE(ig), ig->item, ig->item);
+    }
+    else {
+        if (ig->nitems == 1)
+            return Py_BuildValue("O(O)((O)O)", Py_TYPE(ig), ig->item, ig->item, ig->defaultvalue);
+        return Py_BuildValue("OO(OO)", Py_TYPE(ig), ig->item, ig->item, ig->defaultvalue);
+    }
+}
+
+static PyObject *
+itemgetter_setstate(itemgetterobject *ig, PyObject *state)
+{
+    PyObject *args, *item, *defaultvalue = NULL;
+    Py_ssize_t nitems;
+
+    if (!PyTuple_Check(state) ||
+        !(((PyTuple_GET_SIZE(state) == 1) &&
+                PyArg_ParseTuple(state, "O", &args)) ||
+          ((PyTuple_GET_SIZE(state) == 2) &&
+                PyArg_ParseTuple(state, "OO", &args, &defaultvalue))) ||
+        !PyTuple_Check(args))
+    {
+        PyErr_SetString(PyExc_TypeError, "invalid partial state");
+        return NULL;
+    }
+
+    nitems = PyTuple_GET_SIZE(args);
+    if (nitems <= 1) {
+        if (!PyArg_UnpackTuple(args, "itemgetter", 1, 1, &item))
+            return NULL;
+    } else
+        item = args;
+
+    ig->nitems = nitems;
+    Py_INCREF(item);
+    Py_XSETREF(ig->item, item);
+    if (defaultvalue != NULL) {
+        Py_INCREF(defaultvalue);
+        Py_XSETREF(ig->defaultvalue, defaultvalue);
+    }
+    else {
+        ig->defaultvalue = NULL;
+    }
+    Py_RETURN_NONE;
 }
 
 PyDoc_STRVAR(reduce_doc, "Return state information for pickling");
@@ -1052,6 +1129,8 @@ PyDoc_STRVAR(reduce_doc, "Return state information for pickling");
 static PyMethodDef itemgetter_methods[] = {
     {"__reduce__", (PyCFunction)itemgetter_reduce, METH_NOARGS,
      reduce_doc},
+    {"__setstate__", (PyCFunction)itemgetter_setstate, METH_O,
+     NULL},
     {NULL}
 };
 
@@ -1060,7 +1139,13 @@ PyDoc_STRVAR(itemgetter_doc,
 \n\
 Return a callable object that fetches the given item(s) from its operand.\n\
 After f = itemgetter(2), the call f(r) returns r[2].\n\
-After g = itemgetter(2, 5, 3), the call g(r) returns (r[2], r[5], r[3])");
+After g = itemgetter(2, 5, 3), the call g(r) returns (r[2], r[5], r[3])\n\
+\n\
+You can create a callable object that returns a default value if it cannot\n\
+get the item(s).\n\
+\n\
+After f = itemgetter(2, default=3), the call f(r) returns\n\
+  r[2] if 2 in r, else 3.\n");
 
 static PyTypeObject itemgetter_type = {
     PyVarObject_HEAD_INIT(NULL, 0)

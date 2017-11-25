@@ -401,6 +401,15 @@ class OperatorTestCase:
         self.assertEqual(operator.itemgetter(2,10,5)(data), ('2', '10', '5'))
         self.assertRaises(TypeError, operator.itemgetter(2, 'x', 5), data)
 
+        # with default value
+        f = operator.itemgetter(1, 50, default=None)
+        self.assertEqual(f(data), ('1', None))
+        self.assertRaises(SyntaxError, f, C())
+
+        f = operator.itemgetter(50, default=None)
+        self.assertIsNone(f(data))
+        self.assertRaises(SyntaxError, f, C())
+
     def test_methodcaller(self):
         operator = self.module
         self.assertRaises(TypeError, operator.methodcaller)
